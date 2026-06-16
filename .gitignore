@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+provider_outputs/
+high_volume_stocks.csv
