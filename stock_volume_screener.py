@@ -34,29 +34,26 @@ END_DATE = "20260615"
 def get_a_share_stocks() -> pd.DataFrame:
     """
     返回 DataFrame，列：['code', 'name']
+    数据源：东方财富 stock_zh_a_spot_em（比上交所官网接口更稳定）
     过滤规则：
-      - 代码以 8 或 4 开头的为北交所股票（保留）
-      - 代码以 0、3、6 开头的为沪深A股（保留）
-      - 排除名称中含有 ETF、LOF、基金、指数 等关键字的标的
-      - 排除代码以 999、000、880 开头的指数代码
+      - 保留代码以 0（深圳主板）、3（创业板）、6（上海主板）、4/8（北交所）开头的A股
+      - 排除名称中含有 ETF、LOF、基金、指数、债、期货 等关键字的标的
+      - 排除B股（代码以 900 或 200 开头）
     """
-    print("Step 1: 获取A股股票列表...")
-    df = ak.stock_info_a_code_name()
+    print("Step 1: 获取A股股票列表（东方财富接口）...")
+    df = ak.stock_zh_a_spot_em()
+    # 东方财富返回列：序号, 代码, 名称, 最新价, ...
+    df = df[["代码", "名称"]].copy()
     df.columns = ["code", "name"]
 
     total_before = len(df)
-
-    # 过滤指数代码（通常以 000 开头且为6位纯数字指数，或 399 开头深证指数）
-    index_prefixes = ("999", "880", "8880")
-    df = df[~df["code"].str.startswith(index_prefixes)]
 
     # 过滤名称中含基金/ETF/LOF/指数相关关键字
     fund_keywords = ["ETF", "LOF", "基金", "指数", "债", "期货"]
     pattern = "|".join(fund_keywords)
     df = df[~df["name"].str.contains(pattern, case=False, na=False)]
 
-    # 只保留合法的A股前缀：0（深圳主板/中小板）、3（创业板）、6（上海主板）、
-    #                       4/8（北交所）、9（B股，可选过滤）
+    # 只保留合法的A股前缀
     valid_prefixes = ("0", "3", "6", "4", "8")
     df = df[df["code"].str.startswith(valid_prefixes)]
 
