@@ -21,8 +21,11 @@ import pandas as pd
 TOP_N = 300          # 每个交易日取交易量前 N 名
 TRADING_DAYS = 20    # 统计近 N 个交易日
 MIN_FREQ = 5         # 进入前300的最少次数阈值
-TEST_LIMIT = 10      # 测试模式只取前 N 只股票（None 表示取全部）
+TEST_LIMIT = None    # 测试模式只取前 N 只股票（None 表示取全部）
 REQUEST_DELAY = 0.3  # 每次请求后的等待秒数，避免被限流
+
+# 统计截止日期，格式 "YYYYMMDD"，空字符串表示取最新数据
+END_DATE = "20260615"
 
 
 # ──────────────────────────────────────────────
@@ -77,9 +80,9 @@ def fetch_volume_for_stock(code: str) -> pd.DataFrame | None:
         df = ak.stock_zh_a_hist(
             symbol=code,
             period="daily",
-            adjust="",          # 不复权
-            start_date="",      # 留空让 akshare 返回最近数据
-            end_date="",
+            adjust="",           # 不复权
+            start_date="",       # 留空，由 end_date 向前取足够天数
+            end_date=END_DATE,   # 截止日期，空字符串表示最新
         )
         if df is None or df.empty:
             return None
