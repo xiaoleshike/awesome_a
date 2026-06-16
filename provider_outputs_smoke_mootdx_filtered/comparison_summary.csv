@@ -1,0 +1,2 @@
+﻿provider,elapsed_seconds,stock_count,success_count,failed_count,success_rate,trading_days,complete_history_count,complete_history_rate,avg_history_days,result_rows,output_csv,errors
+mootdx,7.132,3,2,1,0.6667,5,0,0.0,4.0,0,provider_outputs_smoke_mootdx_filtered/mootdx_high_volume_stocks.csv,['000004: empty history']

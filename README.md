@@ -36,12 +36,12 @@ python3 stock_volume_compare.py --provider tdx2db --tdx2db-sqlite tdx.db --tdx2d
 全量对比：
 
 ```bash
-python3 stock_volume_compare.py --provider all --limit 0 --end-date 20260615
+python3 stock_volume_compare.py --provider all --limit 0 --start-date 20260608 --end-date 20260612 --days 5 --workers 8
 ```
 
 输出目录默认是 `provider_outputs/`：
 
-- `comparison_summary.csv`：运行效率、股票数、成功数、失败数、成功率、结果行数
+- `comparison_summary.csv`：运行效率、股票数、成功数、失败数、成功率、完整5日数据覆盖率、平均返回交易日数、结果行数
 - `{provider}_high_volume_stocks.csv`：每个 provider 的最终高频成交量股票结果
 - `{provider}_top_per_day.json`：每个交易日成交量前300股票
 - `accuracy_overlap.csv`：provider 结果之间的集合重合度，用于初步评估准确性/一致性

@@ -1,0 +1,2 @@
+﻿provider,elapsed_seconds,stock_count,success_count,failed_count,success_rate,trading_days,result_rows,output_csv,errors
+baostock,151.236,3,3,0,1.0,5,3,provider_outputs_smoke_baostock_filtered/baostock_high_volume_stocks.csv,[]

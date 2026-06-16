@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import sqlite3
@@ -28,8 +29,19 @@ TOP_N = 300
 TRADING_DAYS = 20
 MIN_FREQ = 5
 END_DATE = "20260615"
+START_DATE = None
 REQUEST_DELAY = 0.1
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def ensure_pandas_append_compat() -> None:
+    if hasattr(pd.DataFrame, "append"):
+        return
+
+    def append(self: pd.DataFrame, other: pd.DataFrame, ignore_index: bool = False, **kwargs: object) -> pd.DataFrame:
+        return pd.concat([self, other], ignore_index=ignore_index, **kwargs)
+
+    pd.DataFrame.append = append  # type: ignore[attr-defined]
 
 
 def normalize_code(code: object) -> str:
@@ -50,9 +62,7 @@ def is_a_share_code(code: object) -> bool:
     code = normalize_code(code)
     if len(code) != 6 or not code.isdigit():
         return False
-    if code.startswith(("200", "900")):
-        return False
-    return code.startswith(("0", "3", "6", "4", "8"))
+    return code.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "4", "8"))
 
 
 def tdx_market(code: str) -> int | None:
@@ -61,6 +71,8 @@ def tdx_market(code: str) -> int | None:
         return 0
     if code.startswith(("6", "9")):
         return 1
+    if code.startswith(("4", "8")):
+        return 2
     return None
 
 
@@ -85,7 +97,7 @@ def normalize_stock_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[["code", "name"]].drop_duplicates("code").reset_index(drop=True)
 
 
-def normalize_history_df(df: pd.DataFrame, end_date: str, days: int) -> pd.DataFrame:
+def normalize_history_df(df: pd.DataFrame, end_date: str, days: int, start_date: str | None = None) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["date", "volume"])
     df = df.copy()
@@ -102,11 +114,15 @@ def normalize_history_df(df: pd.DataFrame, end_date: str, days: int) -> pd.DataF
     if "date" not in df.columns or "volume" not in df.columns:
         return pd.DataFrame(columns=["date", "volume"])
     end = pd.to_datetime(end_date)
+    start = pd.to_datetime(start_date) if start_date else None
     df = df[["date", "volume"]].copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     df = df.dropna(subset=["date", "volume"])
+    df["date"] = df["date"].dt.normalize()
     df = df[df["date"] <= end]
+    if start is not None:
+        df = df[df["date"] >= start]
     return df.sort_values("date").tail(days).reset_index(drop=True)
 
 
@@ -148,6 +164,9 @@ class ProviderRunResult:
     failed_count: int
     success_rate: float
     trading_days: int
+    complete_history_count: int
+    complete_history_rate: float
+    avg_history_days: float
     result_rows: int
     output_csv: str
     errors: list[str]
@@ -161,7 +180,7 @@ class VolumeProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def history(self, code: str, end_date: str, days: int) -> pd.DataFrame:
+    def history(self, code: str, end_date: str, days: int, start_date: str | None = None) -> pd.DataFrame:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -188,30 +207,49 @@ class MootdxProvider(VolumeProvider):
             return pd.DataFrame(columns=["code", "name"])
         return normalize_stock_df(pd.concat(frames, ignore_index=True))
 
-    def history(self, code: str, end_date: str, days: int) -> pd.DataFrame:
-        raw = self.client.daily(symbol=normalize_code(code))
+    def history(self, code: str, end_date: str, days: int, start_date: str | None = None) -> pd.DataFrame:
+        raw = self.client.bars(symbol=normalize_code(code), frequency=9, start=0, offset=max(days * 3, 80))
         df = pd.DataFrame(raw)
-        return normalize_history_df(df, end_date, days)
+        return normalize_history_df(df, end_date, days, start_date)
 
 
 class EasyTdxProvider(VolumeProvider):
     name = "easytdx"
 
     def __init__(self) -> None:
-        from easytdx import TdxHq_API
+        try:
+            from easytdx import TdxHq_API
+        except ImportError:
+            from easy_tdx import TdxClient
+            from easy_tdx.models.enums import KlineCategory, Market
 
-        self.api = TdxHq_API()
-        if hasattr(self.api, "connect_best_ip"):
-            self.api.connect_best_ip()
+            self.api = TdxClient(
+                host="119.147.212.81",
+                port=7709,
+                timeout=5,
+                auto_reconnect=False,
+                heartbeat_interval=0,
+            )
+            self.api.connect()
+            self._easy_tdx_market = {0: Market.SZ, 1: Market.SH, 2: Market.BJ}
+            self._easy_tdx_day = KlineCategory.DAY
+            self._legacy_api = False
         else:
-            self.api.connect("119.147.212.81", 7709)
+            self.api = TdxHq_API()
+            if hasattr(self.api, "connect_best_ip"):
+                self.api.connect_best_ip()
+            else:
+                self.api.connect("119.147.212.81", 7709)
+            self._legacy_api = True
 
     def list_stocks(self, end_date: str) -> pd.DataFrame:
         frames = []
-        for market in (0, 1):
+        markets = (0, 1) if self._legacy_api else (0, 1, 2)
+        for market in markets:
             start = 0
             while True:
-                batch = self.api.get_security_list(market, start)
+                api_market = market if self._legacy_api else self._easy_tdx_market[market]
+                batch = self.api.get_security_list(api_market, start)
                 frame = pd.DataFrame(batch)
                 if frame.empty:
                     break
@@ -223,13 +261,22 @@ class EasyTdxProvider(VolumeProvider):
             return pd.DataFrame(columns=["code", "name"])
         return normalize_stock_df(pd.concat(frames, ignore_index=True))
 
-    def history(self, code: str, end_date: str, days: int) -> pd.DataFrame:
+    def history(self, code: str, end_date: str, days: int, start_date: str | None = None) -> pd.DataFrame:
         market = tdx_market(code)
         if market is None:
             return pd.DataFrame(columns=["date", "volume"])
-        raw = self.api.get_security_bars(9, market, normalize_code(code), 0, max(days * 3, 80))
+        if self._legacy_api:
+            raw = self.api.get_security_bars(9, market, normalize_code(code), 0, max(days * 3, 80))
+        else:
+            raw = self.api.get_security_bars(
+                self._easy_tdx_market[market],
+                normalize_code(code),
+                self._easy_tdx_day,
+                0,
+                max(days * 3, 80),
+            )
         df = pd.DataFrame(raw)
-        return normalize_history_df(df, end_date, days)
+        return normalize_history_df(df, end_date, days, start_date)
 
     def close(self) -> None:
         disconnect = getattr(self.api, "disconnect", None)
@@ -282,7 +329,7 @@ class Tdx2dbProvider(VolumeProvider):
             df = pd.read_sql_query(f"SELECT DISTINCT {cols} FROM {self.table}", conn)
         return normalize_stock_df(df)
 
-    def history(self, code: str, end_date: str, days: int) -> pd.DataFrame:
+    def history(self, code: str, end_date: str, days: int, start_date: str | None = None) -> pd.DataFrame:
         code = normalize_code(code)
         if self.csv_path:
             df = self._load_csv()
@@ -301,13 +348,14 @@ class Tdx2dbProvider(VolumeProvider):
                     params=(code,),
                 )
         subset = subset.rename(columns={self.date_col: "date", self.volume_col: "volume"})
-        return normalize_history_df(subset, end_date, days)
+        return normalize_history_df(subset, end_date, days, start_date)
 
 
 class BaoStockProvider(VolumeProvider):
     name = "baostock"
 
     def __init__(self) -> None:
+        ensure_pandas_append_compat()
         import baostock as bs
 
         self.bs = bs
@@ -316,16 +364,23 @@ class BaoStockProvider(VolumeProvider):
             raise RuntimeError(f"baostock login failed: {login.error_msg}")
 
     def list_stocks(self, end_date: str) -> pd.DataFrame:
-        day = datetime.strptime(end_date, "%Y%m%d").strftime("%Y-%m-%d")
-        rs = self.bs.query_all_stock(day=day)
+        rs = self.bs.query_stock_basic()
         df = rs.get_data()
         df = df.rename(columns={"code": "code", "code_name": "name"})
+        if "type" in df.columns:
+            df = df[df["type"].astype(str) == "1"]
+        if "status" in df.columns:
+            df = df[df["status"].astype(str) == "1"]
         df["code"] = df["code"].map(normalize_code)
         return normalize_stock_df(df)
 
-    def history(self, code: str, end_date: str, days: int) -> pd.DataFrame:
+    def history(self, code: str, end_date: str, days: int, start_date: str | None = None) -> pd.DataFrame:
         end = datetime.strptime(end_date, "%Y%m%d")
-        start = (end - timedelta(days=max(90, days * 5))).strftime("%Y-%m-%d")
+        start = (
+            datetime.strptime(start_date, "%Y%m%d").strftime("%Y-%m-%d")
+            if start_date
+            else (end - timedelta(days=max(90, days * 5))).strftime("%Y-%m-%d")
+        )
         end_text = end.strftime("%Y-%m-%d")
         rs = self.bs.query_history_k_data_plus(
             baostock_code(code),
@@ -336,7 +391,7 @@ class BaoStockProvider(VolumeProvider):
             adjustflag="3",
         )
         df = rs.get_data().rename(columns={"volume": "volume"})
-        return normalize_history_df(df, end_date, days)
+        return normalize_history_df(df, end_date, days, start_date)
 
     def close(self) -> None:
         self.bs.logout()
@@ -367,31 +422,96 @@ def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[Provider
     provider = build_provider(args, provider_name)
     errors: list[str] = []
     histories: dict[str, pd.DataFrame] = {}
+    status_rows: list[dict[str, object]] = []
     stocks = pd.DataFrame(columns=["code", "name"])
     output_csv = ""
     try:
-        stocks = provider.list_stocks(args.end_date)
-        if args.limit:
-            stocks = stocks.head(args.limit).copy()
-        total = len(stocks)
-        for i, row in enumerate(stocks.itertuples(index=False), start=1):
-            code = row.code
-            try:
-                df = provider.history(code, args.end_date, args.days)
-                if len(df) >= min(args.days, 1):
-                    histories[code] = df
-                else:
-                    errors.append(f"{code}: empty history")
-            except Exception as exc:  # noqa: BLE001 - keep batch running for success-rate comparison
-                errors.append(f"{code}: {exc}")
-            if args.delay:
-                time.sleep(args.delay)
-            if args.verbose and (i % 100 == 0 or i == total):
-                print(f"{provider_name}: {i}/{total}, success={len(histories)}, failed={len(errors)}")
-
-        result, top_per_day = calculate_frequency(stocks, histories, args.top_n, args.min_freq)
         output_path = Path(args.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
+        history_cache = output_path / f"{provider_name}_histories.csv"
+        status_csv = output_path / f"{provider_name}_history_status.csv"
+
+        stocks = provider.list_stocks(args.end_date)
+        if args.codes_file:
+            codes = pd.read_csv(args.codes_file, dtype=str, header=None).iloc[:, 0].map(normalize_code)
+            stocks = stocks[stocks["code"].isin(set(codes))].copy()
+        if args.limit:
+            stocks = stocks.head(args.limit).copy()
+        if args.resume and history_cache.exists():
+            cached = pd.read_csv(history_cache, dtype={"code": str})
+            for code, group in cached.groupby("code"):
+                df = normalize_history_df(group[["date", "volume"]], args.end_date, args.days, args.start_date)
+                if not df.empty:
+                    histories[normalize_code(code)] = df
+        rows = list(stocks.itertuples(index=False))
+        total = len(rows)
+
+        def fetch_history(row: object) -> tuple[str, pd.DataFrame | None, str | None]:
+            code = row.code
+            last_error = "empty history"
+            for attempt in range(args.retries + 1):
+                try:
+                    df = provider.history(code, args.end_date, args.days, args.start_date)
+                    if len(df) >= min(args.days, 1):
+                        return code, df, None
+                    last_error = "empty history"
+                except Exception as exc:  # noqa: BLE001 - keep batch running for success-rate comparison
+                    last_error = str(exc)
+                if attempt < args.retries and args.retry_delay:
+                    time.sleep(args.retry_delay)
+            return code, None, last_error
+
+        if args.workers <= 1:
+            for i, row in enumerate(rows, start=1):
+                if row.code in histories:
+                    status_rows.append({"code": row.code, "name": row.name, "success": True, "history_days": len(histories[row.code]), "error": "cached"})
+                    continue
+                code, df, error = fetch_history(row)
+                if df is not None:
+                    histories[code] = df
+                    status_rows.append({"code": code, "name": row.name, "success": True, "history_days": len(df), "error": ""})
+                elif error:
+                    errors.append(f"{code}: {error}")
+                    status_rows.append({"code": code, "name": row.name, "success": False, "history_days": 0, "error": error})
+                if args.delay:
+                    time.sleep(args.delay)
+                if args.verbose and (i % 100 == 0 or i == total):
+                    print(f"{provider_name}: {i}/{total}, success={len(histories)}, failed={len(errors)}")
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {}
+                row_by_code = {}
+                cached_count = 0
+                for row in rows:
+                    if row.code in histories:
+                        status_rows.append({"code": row.code, "name": row.name, "success": True, "history_days": len(histories[row.code]), "error": "cached"})
+                        cached_count += 1
+                        continue
+                    future = executor.submit(fetch_history, row)
+                    futures[future] = row.code
+                    row_by_code[row.code] = row
+                for i, future in enumerate(as_completed(futures), start=1):
+                    code, df, error = future.result()
+                    row = row_by_code[code]
+                    if df is not None:
+                        histories[code] = df
+                        status_rows.append({"code": code, "name": row.name, "success": True, "history_days": len(df), "error": ""})
+                    elif error:
+                        errors.append(f"{code}: {error}")
+                        status_rows.append({"code": code, "name": row.name, "success": False, "history_days": 0, "error": error})
+                    if args.delay:
+                        time.sleep(args.delay)
+                    done = cached_count + i
+                    if args.verbose and (done % 100 == 0 or done == total):
+                        print(f"{provider_name}: {done}/{total}, success={len(histories)}, failed={len(errors)}")
+
+        result, top_per_day = calculate_frequency(stocks, histories, args.top_n, args.min_freq)
+        history_rows = []
+        for code, df in histories.items():
+            for row in df.itertuples(index=False):
+                history_rows.append({"code": code, "date": row.date, "volume": row.volume})
+        pd.DataFrame(history_rows).to_csv(history_cache, index=False, encoding="utf-8-sig")
+        pd.DataFrame(status_rows).to_csv(status_csv, index=False, encoding="utf-8-sig")
         output_csv = str(output_path / f"{provider_name}_high_volume_stocks.csv")
         result.to_csv(output_csv, index=False, encoding="utf-8-sig")
         (output_path / f"{provider_name}_top_per_day.json").write_text(
@@ -404,6 +524,8 @@ def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[Provider
     elapsed = time.perf_counter() - start_time
     success = len(histories)
     failed = len(stocks) - success
+    history_lengths = [len(df) for df in histories.values()]
+    complete = sum(1 for length in history_lengths if length >= args.days)
     summary = ProviderRunResult(
         provider=provider_name,
         elapsed_seconds=round(elapsed, 3),
@@ -412,6 +534,9 @@ def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[Provider
         failed_count=failed,
         success_rate=round(success / len(stocks), 4) if len(stocks) else 0.0,
         trading_days=args.days,
+        complete_history_count=complete,
+        complete_history_rate=round(complete / success, 4) if success else 0.0,
+        avg_history_days=round(sum(history_lengths) / success, 2) if success else 0.0,
         result_rows=len(pd.read_csv(output_csv)) if output_csv else 0,
         output_csv=output_csv,
         errors=errors[:20],
@@ -445,13 +570,19 @@ def compare_results(results: dict[str, pd.DataFrame], output_dir: str) -> None:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare A-share volume providers.")
     parser.add_argument("--provider", choices=["mootdx", "easytdx", "tdx2db", "baostock", "all"], default="all")
+    parser.add_argument("--start-date", default=START_DATE, help="YYYYMMDD inclusive start date, e.g. 20260608")
     parser.add_argument("--end-date", default=END_DATE, help="YYYYMMDD, e.g. 20260615")
     parser.add_argument("--days", type=int, default=TRADING_DAYS)
     parser.add_argument("--top-n", type=int, default=TOP_N)
     parser.add_argument("--min-freq", type=int, default=MIN_FREQ)
     parser.add_argument("--limit", type=int, default=10, help="first N stocks for trial; 0 means all")
     parser.add_argument("--delay", type=float, default=REQUEST_DELAY)
+    parser.add_argument("--workers", type=int, default=1, help="parallel history fetch workers; 1 means serial")
+    parser.add_argument("--retries", type=int, default=0, help="retry failed or empty history requests per stock")
+    parser.add_argument("--retry-delay", type=float, default=0.0, help="seconds to wait between retries")
     parser.add_argument("--output-dir", default="provider_outputs")
+    parser.add_argument("--codes-file", default=None, help="optional one-code-per-line CSV/text file limiting stocks to retry")
+    parser.add_argument("--resume", action="store_true", help="reuse existing provider histories in output-dir and retry missing stocks")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--tdx2db-csv", default=None, help="tdx2db exported CSV with code/date/volume columns")
     parser.add_argument("--tdx2db-sqlite", default=None, help="tdx2db SQLite database path")
@@ -461,8 +592,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tdx2db-date-col", default="date")
     parser.add_argument("--tdx2db-volume-col", default="volume")
     args = parser.parse_args(argv)
+    if args.start_date and args.start_date > args.end_date:
+        parser.error("--start-date must be earlier than or equal to --end-date")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.retries < 0:
+        parser.error("--retries must be non-negative")
     if args.limit == 0:
         args.limit = None
+    if args.start_date:
+        args.days = max(args.days, len(pd.bdate_range(args.start_date, args.end_date)))
     return args
 
 
@@ -489,6 +628,9 @@ def main(argv: Iterable[str] | None = None) -> None:
                     "failed_count": 0,
                     "success_rate": 0,
                     "trading_days": args.days,
+                    "complete_history_count": 0,
+                    "complete_history_rate": 0,
+                    "avg_history_days": 0,
                     "result_rows": 0,
                     "output_csv": "",
                     "errors": [str(exc)],

@@ -1,0 +1,5 @@
+﻿provider,elapsed_seconds,stock_count,success_count,failed_count,success_rate,trading_days,complete_history_count,complete_history_rate,avg_history_days,result_rows,output_csv,errors
+mootdx,6.286,3,0,3,0.0,5,0.0,0.0,0.0,0,provider_outputs_compare_baseline_20260608_20260612/mootdx_high_volume_stocks.csv,"[""395004: 'StdQuotes' object has no attribute 'daily'"", ""395002: 'StdQuotes' object has no attribute 'daily'"", ""395001: 'StdQuotes' object has no attribute 'daily'""]"
+easytdx,0.0,0,0,0,0.0,5,,,,0,,['无法连接 119.147.212.81:7709: timed out']
+tdx2db,0.0,0,0,0,0.0,5,,,,0,,['tdx2db provider requires --tdx2db-csv or --tdx2db-sqlite']
+baostock,137.808,3,3,0,1.0,5,3.0,1.0,5.0,3,provider_outputs_compare_baseline_20260608_20260612/baostock_high_volume_stocks.csv,[]

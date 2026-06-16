@@ -1,0 +1,2 @@
+﻿provider,elapsed_seconds,stock_count,success_count,failed_count,success_rate,trading_days,result_rows,output_csv,errors
+mootdx,22.847,1,0,1,0.0,5,0,provider_outputs_smoke_mootdx/mootdx_high_volume_stocks.csv,"[""395001: 'StdQuotes' object has no attribute 'daily'""]"

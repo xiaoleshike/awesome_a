@@ -10,6 +10,7 @@ A股高频交易量股票筛选器
 
 import time
 from collections import Counter
+from datetime import datetime
 
 import akshare as ak
 import pandas as pd
@@ -19,13 +20,14 @@ import pandas as pd
 # 配置
 # ──────────────────────────────────────────────
 TOP_N = 300          # 每个交易日取交易量前 N 名
-TRADING_DAYS = 20    # 统计近 N 个交易日
+TRADING_DAYS = 5     # 统计近 N 个交易日
 MIN_FREQ = 5         # 进入前300的最少次数阈值
 TEST_LIMIT = None    # 测试模式只取前 N 只股票（None 表示取全部）
 REQUEST_DELAY = 0.3  # 每次请求后的等待秒数，避免被限流
 
 # 统计截止日期，格式 "YYYYMMDD"，空字符串表示取最新数据
-END_DATE = "20260615"
+END_DATE = "20260612"
+START_DATE = "20260608"
 
 
 # ──────────────────────────────────────────────
@@ -88,6 +90,9 @@ def fetch_volume_for_stock(code: str) -> pd.DataFrame | None:
         df = df[["日期", "成交量"]].copy()
         df.columns = ["date", "volume"]
         df["date"] = pd.to_datetime(df["date"])
+        if START_DATE:
+            start = pd.to_datetime(datetime.strptime(START_DATE, "%Y%m%d"))
+            df = df[df["date"] >= start]
         df = df.sort_values("date").tail(TRADING_DAYS).reset_index(drop=True)
         return df
     except Exception as e:
