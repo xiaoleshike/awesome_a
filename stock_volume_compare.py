@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import sqlite3
+import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -28,7 +30,7 @@ import pandas as pd
 TOP_N = 300
 TRADING_DAYS = 20
 MIN_FREQ = 5
-END_DATE = "20260615"
+END_DATE = datetime.now().strftime("%Y%m%d")
 START_DATE = None
 REQUEST_DELAY = 0.1
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -107,7 +109,7 @@ def normalize_history_df(df: pd.DataFrame, end_date: str, days: int, start_date:
                 df["date"] = df[col]
                 break
     if "volume" not in df.columns:
-        for col in ("vol", "amount", "成交量"):
+        for col in ("vol", "成交量"):
             if col in df.columns:
                 df["volume"] = df[col]
                 break
@@ -420,11 +422,32 @@ def build_provider(args: argparse.Namespace, name: str) -> VolumeProvider:
 def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[ProviderRunResult, pd.DataFrame]:
     start_time = time.perf_counter()
     provider = build_provider(args, provider_name)
+    worker_local = threading.local()
+    worker_providers: list[VolumeProvider] = []
+    worker_providers_lock = threading.Lock()
     errors: list[str] = []
     histories: dict[str, pd.DataFrame] = {}
     status_rows: list[dict[str, object]] = []
     stocks = pd.DataFrame(columns=["code", "name"])
     output_csv = ""
+
+    def close_provider_safely(target: VolumeProvider) -> None:
+        try:
+            target.close()
+        except Exception:
+            pass
+
+    def get_history_provider() -> VolumeProvider:
+        if args.workers <= 1:
+            return provider
+        worker_provider = getattr(worker_local, "provider", None)
+        if worker_provider is None:
+            worker_provider = build_provider(args, provider_name)
+            worker_local.provider = worker_provider
+            with worker_providers_lock:
+                worker_providers.append(worker_provider)
+        return worker_provider
+
     try:
         output_path = Path(args.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -451,7 +474,8 @@ def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[Provider
             last_error = "empty history"
             for attempt in range(args.retries + 1):
                 try:
-                    df = provider.history(code, args.end_date, args.days, args.start_date)
+                    history_provider = get_history_provider()
+                    df = history_provider.history(code, args.end_date, args.days, args.start_date)
                     if len(df) >= min(args.days, 1):
                         return code, df, None
                     last_error = "empty history"
@@ -519,7 +543,9 @@ def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[Provider
             encoding="utf-8",
         )
     finally:
-        provider.close()
+        close_provider_safely(provider)
+        for worker_provider in worker_providers:
+            close_provider_safely(worker_provider)
 
     elapsed = time.perf_counter() - start_time
     success = len(histories)
@@ -537,11 +563,11 @@ def run_provider(args: argparse.Namespace, provider_name: str) -> tuple[Provider
         complete_history_count=complete,
         complete_history_rate=round(complete / success, 4) if success else 0.0,
         avg_history_days=round(sum(history_lengths) / success, 2) if success else 0.0,
-        result_rows=len(pd.read_csv(output_csv)) if output_csv else 0,
+        result_rows=len(result),
         output_csv=output_csv,
         errors=errors[:20],
     )
-    return summary, pd.read_csv(output_csv) if output_csv else pd.DataFrame()
+    return summary, result
 
 
 def compare_results(results: dict[str, pd.DataFrame], output_dir: str) -> None:
@@ -568,11 +594,18 @@ def compare_results(results: dict[str, pd.DataFrame], output_dir: str) -> None:
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+
+    def has_cli_flag(flag: str) -> bool:
+        if not argv_list:
+            return False
+        return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv_list)
+
     parser = argparse.ArgumentParser(description="Compare A-share volume providers.")
     parser.add_argument("--provider", choices=["mootdx", "easytdx", "tdx2db", "baostock", "all"], default="all")
     parser.add_argument("--start-date", default=START_DATE, help="YYYYMMDD inclusive start date, e.g. 20260608")
-    parser.add_argument("--end-date", default=END_DATE, help="YYYYMMDD, e.g. 20260615")
-    parser.add_argument("--days", type=int, default=TRADING_DAYS)
+    parser.add_argument("--end-date", default=END_DATE, help="YYYYMMDD, defaults to today")
+    parser.add_argument("--days", type=int, default=TRADING_DAYS, help="rolling window size; ignored in explicit date-range mode")
     parser.add_argument("--top-n", type=int, default=TOP_N)
     parser.add_argument("--min-freq", type=int, default=MIN_FREQ)
     parser.add_argument("--limit", type=int, default=10, help="first N stocks for trial; 0 means all")
@@ -591,17 +624,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tdx2db-name-col", default="name")
     parser.add_argument("--tdx2db-date-col", default="date")
     parser.add_argument("--tdx2db-volume-col", default="volume")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv_list)
+    explicit_start = has_cli_flag("--start-date")
+    explicit_days = has_cli_flag("--days")
     if args.start_date and args.start_date > args.end_date:
         parser.error("--start-date must be earlier than or equal to --end-date")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.retries < 0:
         parser.error("--retries must be non-negative")
+    if explicit_start and explicit_days:
+        parser.error("--start-date/--end-date date-range mode cannot be combined with --days")
     if args.limit == 0:
         args.limit = None
     if args.start_date:
-        args.days = max(args.days, len(pd.bdate_range(args.start_date, args.end_date)))
+        args.days = len(pd.bdate_range(args.start_date, args.end_date))
     return args
 
 
